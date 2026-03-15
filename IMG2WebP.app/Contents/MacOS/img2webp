@@ -1,0 +1,416 @@
+#!/Users/angelchavez/Documents/cat-converter/venv/bin/python3
+# -*- coding: utf-8 -*-
+"""IMG2WebP - Drag & Drop image converter to WebP format."""
+
+import subprocess
+import os
+import sys
+import traceback
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message="PyObjCPointer")
+
+try:
+    import objc
+    from AppKit import (
+        NSApplication, NSWindow, NSView, NSColor, NSFont,
+        NSTextField, NSButton, NSScrollView, NSTextView,
+        NSBezierPath, NSAttributedString,
+        NSFontAttributeName, NSForegroundColorAttributeName,
+        NSBezelStyleRounded, NSBackingStoreBuffered,
+        NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
+        NSWindowStyleMaskMiniaturizable, NSMakeRect,
+        NSFilenamesPboardType, NSDragOperationCopy, NSApp,
+        NSApplicationActivationPolicyRegular, NSTextAlignmentCenter,
+    )
+    from Foundation import NSObject, NSMutableArray, NSDictionary
+except Exception as e:
+    with open('/tmp/img2webp_error.log', 'w') as f:
+        f.write(f"Import error: {e}\n")
+        traceback.print_exc(file=f)
+    sys.exit(1)
+
+VALID_EXT = {'.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp', '.gif', '.avif', '.webp', '.heic', '.heif'}
+CWEBP = '/opt/homebrew/bin/cwebp'
+FFMPEG = '/opt/homebrew/bin/ffmpeg'
+CWEBP_FORMATS = {'.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp', '.gif'}
+
+# -- Colors --
+C_BG = NSColor.colorWithRed_green_blue_alpha_(0.09, 0.09, 0.11, 1.0)
+C_CARD = NSColor.colorWithRed_green_blue_alpha_(0.13, 0.13, 0.16, 1.0)
+C_LOG_BG = NSColor.colorWithRed_green_blue_alpha_(0.07, 0.07, 0.09, 1.0)
+C_ACCENT = NSColor.colorWithRed_green_blue_alpha_(0.40, 0.50, 1.0, 1.0)
+C_ACCENT_DIM = NSColor.colorWithRed_green_blue_alpha_(0.40, 0.50, 1.0, 0.25)
+C_ACCENT_GLOW = NSColor.colorWithRed_green_blue_alpha_(0.40, 0.50, 1.0, 0.10)
+C_WHITE = NSColor.colorWithRed_green_blue_alpha_(0.95, 0.95, 0.97, 1.0)
+C_WHITE50 = NSColor.colorWithRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.45)
+C_GRAY = NSColor.colorWithRed_green_blue_alpha_(0.45, 0.45, 0.50, 1.0)
+C_GREEN = NSColor.colorWithRed_green_blue_alpha_(0.30, 0.85, 0.45, 1.0)
+C_RED = NSColor.colorWithRed_green_blue_alpha_(0.95, 0.35, 0.35, 1.0)
+C_CYAN = NSColor.colorWithRed_green_blue_alpha_(0.40, 0.80, 1.0, 1.0)
+C_ROW_ALT = NSColor.colorWithRed_green_blue_alpha_(0.11, 0.11, 0.14, 1.0)
+
+
+def label(frame, text, font, color, align=None):
+    lbl = NSTextField.alloc().initWithFrame_(frame)
+    lbl.setStringValue_(text)
+    lbl.setBezeled_(False)
+    lbl.setDrawsBackground_(False)
+    lbl.setEditable_(False)
+    lbl.setSelectable_(False)
+    lbl.setFont_(font)
+    lbl.setTextColor_(color)
+    if align is not None:
+        lbl.setAlignment_(align)
+    return lbl
+
+
+class DropZoneView(NSView):
+
+    def initWithFrame_(self, frame):
+        self = objc.super(DropZoneView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self.files = NSMutableArray.alloc().init()
+        self.delegate = None
+        self._hover = False
+        self.registerForDraggedTypes_([NSFilenamesPboardType])
+        return self
+
+    def draggingEntered_(self, sender):
+        pb = sender.draggingPasteboard()
+        if NSFilenamesPboardType in pb.types():
+            self._hover = True
+            self.setNeedsDisplay_(True)
+            return NSDragOperationCopy
+        return 0
+
+    def draggingExited_(self, sender):
+        self._hover = False
+        self.setNeedsDisplay_(True)
+
+    def performDragOperation_(self, sender):
+        self._hover = False
+        pb = sender.draggingPasteboard()
+        paths = pb.propertyListForType_(NSFilenamesPboardType)
+        if paths:
+            for p in paths:
+                ext = os.path.splitext(str(p))[1].lower()
+                if ext in VALID_EXT and p not in self.files:
+                    self.files.addObject_(p)
+            if self.delegate:
+                self.delegate.filesUpdated_(self.files)
+        self.setNeedsDisplay_(True)
+        return True
+
+    def drawRect_(self, rect):
+        b = self.bounds()
+        w, h = b.size.width, b.size.height
+
+        # Fill
+        bg = C_ACCENT_GLOW if self._hover else C_CARD
+        bg.set()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(b, 14, 14).fill()
+
+        # Dashed border
+        inR = NSMakeRect(2, 2, w - 4, h - 4)
+        bp = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(inR, 12, 12)
+        bp.setLineDash_count_phase_([6.0, 4.0], 2, 0)
+        bp.setLineWidth_(1.5)
+        c = C_ACCENT if self._hover else C_ACCENT_DIM
+        c.set()
+        bp.stroke()
+
+        count = len(self.files) if self.files else 0
+
+        # Center icon
+        icon = "+" if count == 0 else str(count)
+        fsize = 42 if count == 0 else 36
+        iAttrs = NSDictionary.dictionaryWithObjects_forKeys_(
+            [NSFont.systemFontOfSize_weight_(fsize, 0.15),
+             C_ACCENT if self._hover else C_WHITE50],
+            [NSFontAttributeName, NSForegroundColorAttributeName]
+        )
+        iStr = NSAttributedString.alloc().initWithString_attributes_(icon, iAttrs)
+        iSz = iStr.size()
+        iStr.drawAtPoint_(((w - iSz.width) / 2, h / 2 + 4))
+
+        # Label
+        txt = "Drop images here" if count == 0 else ("image" + ("s" if count != 1 else "") + " ready")
+        tAttrs = NSDictionary.dictionaryWithObjects_forKeys_(
+            [NSFont.systemFontOfSize_weight_(13, 0.2), C_WHITE50],
+            [NSFontAttributeName, NSForegroundColorAttributeName]
+        )
+        tStr = NSAttributedString.alloc().initWithString_attributes_(txt, tAttrs)
+        tSz = tStr.size()
+        tStr.drawAtPoint_(((w - tSz.width) / 2, h / 2 - 26))
+
+        # Formats
+        sub = "PNG  JPG  AVIF  HEIC  TIFF  GIF" if count == 0 else "drop more or click Convert"
+        sAttrs = NSDictionary.dictionaryWithObjects_forKeys_(
+            [NSFont.systemFontOfSize_(10), C_GRAY],
+            [NSFontAttributeName, NSForegroundColorAttributeName]
+        )
+        sStr = NSAttributedString.alloc().initWithString_attributes_(sub, sAttrs)
+        sSz = sStr.size()
+        sStr.drawAtPoint_(((w - sSz.width) / 2, h / 2 - 44))
+
+
+class AppDelegate(NSObject):
+
+    window = objc.ivar()
+    dropZone = objc.ivar()
+    logView = objc.ivar()
+    convertBtn = objc.ivar()
+    clearBtn = objc.ivar()
+    fileCountLabel = objc.ivar()
+    statusLabel = objc.ivar()
+    fileScrollView = objc.ivar()
+    fileContainer = objc.ivar()
+    emptyLabel = objc.ivar()
+
+    def applicationDidFinishLaunching_(self, notification):
+        W, H = 480, 620
+        P = 20
+        IW = W - P * 2
+
+        self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, W, H),
+            NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable,
+            NSBackingStoreBuffered, False,
+        )
+        self.window.setTitle_("IMG2WebP")
+        self.window.setBackgroundColor_(C_BG)
+        self.window.center()
+        cv = self.window.contentView()
+
+        y = H
+
+        # -- Header --
+        y -= 48
+        cv.addSubview_(label(NSMakeRect(P, y, 40, 26), "=^.^=",
+                             NSFont.monospacedSystemFontOfSize_weight_(11, 0.3), C_ACCENT))
+        cv.addSubview_(label(NSMakeRect(P + 42, y, 200, 28), "IMG2WebP",
+                             NSFont.systemFontOfSize_weight_(20, 0.3), C_WHITE))
+        cv.addSubview_(label(NSMakeRect(P + 42, y - 15, 220, 16), "Image to WebP converter",
+                             NSFont.systemFontOfSize_(11), C_GRAY))
+
+        # -- Drop zone --
+        y -= 30
+        dzH = 140
+        y -= dzH
+        self.dropZone = DropZoneView.alloc().initWithFrame_(NSMakeRect(P, y, IW, dzH))
+        self.dropZone.delegate = self
+        cv.addSubview_(self.dropZone)
+
+        # -- File list header --
+        y -= 26
+        self.fileCountLabel = label(NSMakeRect(P, y, IW, 18), "FILES",
+                                    NSFont.systemFontOfSize_weight_(10, 0.5), C_GRAY)
+        cv.addSubview_(self.fileCountLabel)
+
+        # -- File list --
+        y -= 2
+        flH = 80
+        y -= flH
+
+        # Background card
+        flBg = NSView.alloc().initWithFrame_(NSMakeRect(P, y, IW, flH))
+        flBg.setWantsLayer_(True)
+        flBg.layer().setBackgroundColor_(C_CARD.CGColor())
+        flBg.layer().setCornerRadius_(10)
+        cv.addSubview_(flBg)
+
+        self.fileScrollView = NSScrollView.alloc().initWithFrame_(NSMakeRect(4, 4, IW - 8, flH - 8))
+        self.fileScrollView.setHasVerticalScroller_(True)
+        self.fileScrollView.setDrawsBackground_(False)
+        self.fileScrollView.setBorderType_(0)
+        self.fileContainer = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, IW - 24, flH - 8))
+        self.fileScrollView.setDocumentView_(self.fileContainer)
+        flBg.addSubview_(self.fileScrollView)
+
+        self.emptyLabel = label(NSMakeRect(0, (flH - 20) / 2 - 4, IW, 20),
+                                "No files yet -- drag images above",
+                                NSFont.systemFontOfSize_(11), C_GRAY, NSTextAlignmentCenter)
+        flBg.addSubview_(self.emptyLabel)
+
+        # -- Output header --
+        y -= 26
+        cv.addSubview_(label(NSMakeRect(P, y, IW, 18), "OUTPUT",
+                             NSFont.systemFontOfSize_weight_(10, 0.5), C_GRAY))
+
+        # -- Log area --
+        y -= 2
+        btnH = 44
+        logH = y - btnH - 10
+        logY = btnH + 8
+
+        logBg = NSView.alloc().initWithFrame_(NSMakeRect(P, logY, IW, logH))
+        logBg.setWantsLayer_(True)
+        logBg.layer().setBackgroundColor_(C_LOG_BG.CGColor())
+        logBg.layer().setCornerRadius_(10)
+        cv.addSubview_(logBg)
+
+        logScroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(6, 6, IW - 12, logH - 12))
+        logScroll.setHasVerticalScroller_(True)
+        logScroll.setDrawsBackground_(False)
+        logScroll.setBorderType_(0)
+
+        self.logView = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, IW - 28, logH - 12))
+        self.logView.setEditable_(False)
+        self.logView.setDrawsBackground_(False)
+        self.logView.setFont_(NSFont.monospacedSystemFontOfSize_weight_(11, 0))
+        self.logView.setTextContainerInset_((4, 4))
+        logScroll.setDocumentView_(self.logView)
+        logBg.addSubview_(logScroll)
+
+        # -- Bottom bar --
+        by = 8
+
+        self.clearBtn = NSButton.alloc().initWithFrame_(NSMakeRect(P, by, 90, 30))
+        self.clearBtn.setTitle_("Clear")
+        self.clearBtn.setBezelStyle_(NSBezelStyleRounded)
+        self.clearBtn.setTarget_(self)
+        self.clearBtn.setAction_("clearClicked:")
+        self.clearBtn.setFont_(NSFont.systemFontOfSize_(12))
+        cv.addSubview_(self.clearBtn)
+
+        self.statusLabel = label(NSMakeRect(P + 100, by + 5, IW - 240, 20), "Ready",
+                                 NSFont.systemFontOfSize_(11), C_GRAY, NSTextAlignmentCenter)
+        cv.addSubview_(self.statusLabel)
+
+        self.convertBtn = NSButton.alloc().initWithFrame_(NSMakeRect(W - P - 120, by, 120, 30))
+        self.convertBtn.setTitle_("Convert")
+        self.convertBtn.setBezelStyle_(NSBezelStyleRounded)
+        self.convertBtn.setTarget_(self)
+        self.convertBtn.setAction_("convertClicked:")
+        self.convertBtn.setFont_(NSFont.boldSystemFontOfSize_(13))
+        cv.addSubview_(self.convertBtn)
+
+        # Show window
+        self.window.makeKeyAndOrderFront_(None)
+        NSApp.activateIgnoringOtherApps_(True)
+        self.writeLog("IMG2WebP ready. Drop images and click Convert.", C_GRAY)
+
+    def filesUpdated_(self, files):
+        count = len(files)
+        self.fileCountLabel.setStringValue_(f"FILES ({count})")
+        self.emptyLabel.setHidden_(count > 0)
+
+        # Rebuild list
+        for sv in list(self.fileContainer.subviews()):
+            sv.removeFromSuperview()
+
+        rowH = 22
+        cW = self.fileContainer.frame().size.width
+        totalH = max(rowH * count, self.fileScrollView.frame().size.height - 8)
+        self.fileContainer.setFrameSize_((cW, totalH))
+
+        for i, f in enumerate(files):
+            name = os.path.basename(str(f))
+            ry = totalH - (i + 1) * rowH
+            row = NSView.alloc().initWithFrame_(NSMakeRect(0, ry, cW, rowH))
+
+            if i % 2 == 0:
+                row.setWantsLayer_(True)
+                row.layer().setBackgroundColor_(C_ROW_ALT.CGColor())
+                row.layer().setCornerRadius_(4)
+
+            dot = NSView.alloc().initWithFrame_(NSMakeRect(8, (rowH - 5) / 2, 5, 5))
+            dot.setWantsLayer_(True)
+            dot.layer().setBackgroundColor_(C_ACCENT.CGColor())
+            dot.layer().setCornerRadius_(2.5)
+            row.addSubview_(dot)
+
+            nameLabel = label(NSMakeRect(20, 1, cW - 28, rowH - 2), name,
+                              NSFont.monospacedSystemFontOfSize_weight_(10.5, 0), C_WHITE)
+            row.addSubview_(nameLabel)
+            self.fileContainer.addSubview_(row)
+
+        self.statusLabel.setStringValue_(f"{count} file{'s' if count != 1 else ''} queued")
+        self.statusLabel.setTextColor_(C_ACCENT)
+
+    @objc.python_method
+    def writeLog(self, msg, color=None):
+        if color is None:
+            color = C_GRAY
+        storage = self.logView.textStorage()
+        attrs = NSDictionary.dictionaryWithObjects_forKeys_(
+            [NSFont.monospacedSystemFontOfSize_weight_(11, 0), color],
+            [NSFontAttributeName, NSForegroundColorAttributeName]
+        )
+        s = NSAttributedString.alloc().initWithString_attributes_(msg + "\n", attrs)
+        storage.appendAttributedString_(s)
+        self.logView.scrollRangeToVisible_((storage.length(), 0))
+
+    @objc.typedSelector(b'v@:@')
+    def convertClicked_(self, sender):
+        files = self.dropZone.files
+        if not files or len(files) == 0:
+            self.writeLog("No files to convert.", C_RED)
+            return
+
+        n = len(files)
+        self.writeLog(f"--- Converting {n} file{'s' if n != 1 else ''} ---", C_ACCENT)
+        self.statusLabel.setStringValue_("Converting...")
+        self.statusLabel.setTextColor_(C_CYAN)
+
+        ok = 0
+        fail = 0
+        total_saved = 0
+
+        for fp in list(files):
+            fp = str(fp)
+            out = os.path.splitext(fp)[0] + ".webp"
+            bn = os.path.basename(fp)
+
+            try:
+                ext = os.path.splitext(fp)[1].lower()
+                if ext in CWEBP_FORMATS:
+                    r = subprocess.run([CWEBP, '-q', '80', fp, '-o', out],
+                                       capture_output=True, text=True, timeout=30)
+                else:
+                    r = subprocess.run([FFMPEG, '-y', '-i', fp, '-quality', '80', out],
+                                       capture_output=True, text=True, timeout=30)
+                if r.returncode == 0:
+                    orig = os.path.getsize(fp)
+                    new = os.path.getsize(out)
+                    pct = ((orig - new) * 100) // orig if orig > 0 else 0
+                    total_saved += orig - new
+                    self.writeLog(f"  OK   {bn}  -{pct}%", C_GREEN)
+                    ok += 1
+                else:
+                    self.writeLog(f"  FAIL {bn}", C_RED)
+                    fail += 1
+            except Exception as e:
+                self.writeLog(f"  FAIL {bn}: {e}", C_RED)
+                fail += 1
+
+        mb = total_saved / (1024 * 1024)
+        self.writeLog(f"Done: {ok} converted, {fail} failed, {mb:.1f} MB saved", C_ACCENT)
+        self.statusLabel.setStringValue_(f"Done - {mb:.1f} MB saved")
+        self.statusLabel.setTextColor_(C_GREEN)
+
+    @objc.typedSelector(b'v@:@')
+    def clearClicked_(self, sender):
+        self.dropZone.files.removeAllObjects()
+        self.dropZone.setNeedsDisplay_(True)
+        self.fileCountLabel.setStringValue_("FILES")
+        self.emptyLabel.setHidden_(False)
+        for sv in list(self.fileContainer.subviews()):
+            sv.removeFromSuperview()
+        self.logView.setString_("")
+        self.writeLog("IMG2WebP ready. Drop images and click Convert.", C_GRAY)
+        self.statusLabel.setStringValue_("Ready")
+        self.statusLabel.setTextColor_(C_GRAY)
+
+    def applicationShouldTerminateAfterLastWindowClosed_(self, app):
+        return True
+
+
+if __name__ == '__main__':
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+    d = AppDelegate.alloc().init()
+    app.setDelegate_(d)
+    app.run()
