@@ -22,13 +22,33 @@ try:
         NSWindowStyleMaskMiniaturizable, NSMakeRect,
         NSFilenamesPboardType, NSDragOperationCopy, NSApp,
         NSApplicationActivationPolicyRegular, NSTextAlignmentCenter,
+        NSImageView, NSImage, NSBitmapImageRep, NSCIImageRep,
+        NSImageScaleProportionallyUpOrDown, NSImageAlignCenter,
+        NSAffineTransform, NSCompositingOperationSourceOver,
     )
-    from Foundation import NSObject, NSMutableArray, NSDictionary
+    from Foundation import NSObject, NSMutableArray, NSDictionary, NSURL
 except Exception as e:
     with open('/tmp/img2webp_error.log', 'w') as f:
         f.write(f"Import error: {e}\n")
         traceback.print_exc(file=f)
     sys.exit(1)
+
+# Try to load Vision + CoreImage frameworks for background removal (macOS 14+)
+HAS_VISION = False
+try:
+    _fw = {}
+    objc.loadBundle('Vision', _fw,
+                    bundle_path='/System/Library/Frameworks/Vision.framework')
+    objc.loadBundle('CoreImage', _fw,
+                    bundle_path='/System/Library/Frameworks/CoreImage.framework')
+    VNGenerateForegroundInstanceMaskRequest = _fw['VNGenerateForegroundInstanceMaskRequest']
+    VNImageRequestHandler = _fw['VNImageRequestHandler']
+    CIImage = _fw['CIImage']
+    CIContext = _fw['CIContext']
+    HAS_VISION = True
+    del _fw
+except Exception:
+    pass
 
 VALID_EXT = {'.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp', '.gif', '.avif', '.webp', '.heic', '.heif'}
 CWEBP = '/opt/homebrew/bin/cwebp'
@@ -168,9 +188,18 @@ class AppDelegate(NSObject):
     fileScrollView = objc.ivar()
     fileContainer = objc.ivar()
     emptyLabel = objc.ivar()
+    previewImageView = objc.ivar()
+    previewLabel = objc.ivar()
+    removeBgBtn = objc.ivar()
+    flipBtn = objc.ivar()
+    prevBtn = objc.ivar()
+    nextBtn = objc.ivar()
+    previewBg = objc.ivar()
 
     def applicationDidFinishLaunching_(self, notification):
-        W, H = 480, 620
+        self._selectedIndex = 0
+
+        W, H = 520, 820
         P = 20
         IW = W - P * 2
 
@@ -197,7 +226,7 @@ class AppDelegate(NSObject):
 
         # -- Drop zone --
         y -= 30
-        dzH = 140
+        dzH = 120
         y -= dzH
         self.dropZone = DropZoneView.alloc().initWithFrame_(NSMakeRect(P, y, IW, dzH))
         self.dropZone.delegate = self
@@ -211,7 +240,7 @@ class AppDelegate(NSObject):
 
         # -- File list --
         y -= 2
-        flH = 80
+        flH = 72
         y -= flH
 
         # Background card
@@ -233,6 +262,69 @@ class AppDelegate(NSObject):
                                 "No files yet -- drag images above",
                                 NSFont.systemFontOfSize_(11), C_GRAY, NSTextAlignmentCenter)
         flBg.addSubview_(self.emptyLabel)
+
+        # -- Preview header with nav buttons --
+        y -= 30
+        self.previewLabel = label(NSMakeRect(P, y, IW - 80, 18), "PREVIEW",
+                                  NSFont.systemFontOfSize_weight_(10, 0.5), C_GRAY)
+        cv.addSubview_(self.previewLabel)
+
+        navBtnW = 34
+        self.prevBtn = NSButton.alloc().initWithFrame_(NSMakeRect(W - P - navBtnW * 2 - 4, y - 2, navBtnW, 22))
+        self.prevBtn.setTitle_("\u25C0")
+        self.prevBtn.setBezelStyle_(NSBezelStyleRounded)
+        self.prevBtn.setTarget_(self)
+        self.prevBtn.setAction_("prevClicked:")
+        self.prevBtn.setFont_(NSFont.systemFontOfSize_(10))
+        cv.addSubview_(self.prevBtn)
+
+        self.nextBtn = NSButton.alloc().initWithFrame_(NSMakeRect(W - P - navBtnW, y - 2, navBtnW, 22))
+        self.nextBtn.setTitle_("\u25B6")
+        self.nextBtn.setBezelStyle_(NSBezelStyleRounded)
+        self.nextBtn.setTarget_(self)
+        self.nextBtn.setAction_("nextClicked:")
+        self.nextBtn.setFont_(NSFont.systemFontOfSize_(10))
+        cv.addSubview_(self.nextBtn)
+
+        # -- Preview image area --
+        y -= 4
+        pvH = 200
+        y -= pvH
+
+        self.previewBg = NSView.alloc().initWithFrame_(NSMakeRect(P, y, IW, pvH))
+        self.previewBg.setWantsLayer_(True)
+        self.previewBg.layer().setBackgroundColor_(C_CARD.CGColor())
+        self.previewBg.layer().setCornerRadius_(10)
+        cv.addSubview_(self.previewBg)
+
+        self.previewImageView = NSImageView.alloc().initWithFrame_(NSMakeRect(4, 4, IW - 8, pvH - 8))
+        self.previewImageView.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+        self.previewImageView.setImageAlignment_(NSImageAlignCenter)
+        self.previewBg.addSubview_(self.previewImageView)
+
+        # -- Preview action buttons --
+        y -= 8
+        actionBtnW = (IW - 8) // 2
+        y -= 28
+
+        self.removeBgBtn = NSButton.alloc().initWithFrame_(NSMakeRect(P, y, actionBtnW, 28))
+        self.removeBgBtn.setTitle_("Remove BG")
+        self.removeBgBtn.setBezelStyle_(NSBezelStyleRounded)
+        self.removeBgBtn.setTarget_(self)
+        self.removeBgBtn.setAction_("removeBgClicked:")
+        self.removeBgBtn.setFont_(NSFont.systemFontOfSize_(12))
+        if not HAS_VISION:
+            self.removeBgBtn.setEnabled_(False)
+            self.removeBgBtn.setToolTip_("Requires macOS 14+ with Vision framework")
+        cv.addSubview_(self.removeBgBtn)
+
+        self.flipBtn = NSButton.alloc().initWithFrame_(NSMakeRect(P + actionBtnW + 8, y, actionBtnW, 28))
+        self.flipBtn.setTitle_("Flip \u2194")
+        self.flipBtn.setBezelStyle_(NSBezelStyleRounded)
+        self.flipBtn.setTarget_(self)
+        self.flipBtn.setAction_("flipClicked:")
+        self.flipBtn.setFont_(NSFont.systemFontOfSize_(12))
+        cv.addSubview_(self.flipBtn)
 
         # -- Output header --
         y -= 26
@@ -291,6 +383,8 @@ class AppDelegate(NSObject):
         self.window.makeKeyAndOrderFront_(None)
         NSApp.activateIgnoringOtherApps_(True)
         self.writeLog("IMG2WebP ready. Drop images and click Convert.", C_GRAY)
+        if not HAS_VISION:
+            self.writeLog("Vision framework not available - BG removal disabled.", C_GRAY)
 
     def filesUpdated_(self, files):
         count = len(files)
@@ -311,14 +405,21 @@ class AppDelegate(NSObject):
             ry = totalH - (i + 1) * rowH
             row = NSView.alloc().initWithFrame_(NSMakeRect(0, ry, cW, rowH))
 
-            if i % 2 == 0:
+            isSelected = (i == self._selectedIndex)
+
+            if isSelected:
+                row.setWantsLayer_(True)
+                row.layer().setBackgroundColor_(C_ACCENT_DIM.CGColor())
+                row.layer().setCornerRadius_(4)
+            elif i % 2 == 0:
                 row.setWantsLayer_(True)
                 row.layer().setBackgroundColor_(C_ROW_ALT.CGColor())
                 row.layer().setCornerRadius_(4)
 
             dot = NSView.alloc().initWithFrame_(NSMakeRect(8, (rowH - 5) / 2, 5, 5))
             dot.setWantsLayer_(True)
-            dot.layer().setBackgroundColor_(C_ACCENT.CGColor())
+            dotColor = C_ACCENT if isSelected else C_ACCENT
+            dot.layer().setBackgroundColor_(dotColor.CGColor())
             dot.layer().setCornerRadius_(2.5)
             row.addSubview_(dot)
 
@@ -329,6 +430,178 @@ class AppDelegate(NSObject):
 
         self.statusLabel.setStringValue_(f"{count} file{'s' if count != 1 else ''} queued")
         self.statusLabel.setTextColor_(C_ACCENT)
+
+        # Update preview
+        if count > 0:
+            self._selectedIndex = max(0, min(self._selectedIndex, count - 1))
+            self._updatePreview()
+        else:
+            self._updatePreview()
+
+    @objc.python_method
+    def _updatePreview(self):
+        files = self.dropZone.files
+        count = len(files) if files else 0
+        if count == 0:
+            self.previewImageView.setImage_(None)
+            self.previewLabel.setStringValue_("PREVIEW")
+            return
+        idx = max(0, min(self._selectedIndex, count - 1))
+        self._selectedIndex = idx
+        path = str(files[idx])
+        image = NSImage.alloc().initWithContentsOfFile_(path)
+        self.previewImageView.setImage_(image)
+        self.previewLabel.setStringValue_(f"PREVIEW ({idx + 1}/{count})")
+
+    @objc.typedSelector(b'v@:@')
+    def prevClicked_(self, sender):
+        files = self.dropZone.files
+        if files and len(files) > 0:
+            self._selectedIndex = max(0, self._selectedIndex - 1)
+            self._updatePreview()
+            self.filesUpdated_(files)
+
+    @objc.typedSelector(b'v@:@')
+    def nextClicked_(self, sender):
+        files = self.dropZone.files
+        if files and len(files) > 0:
+            self._selectedIndex = min(len(files) - 1, self._selectedIndex + 1)
+            self._updatePreview()
+            self.filesUpdated_(files)
+
+    @objc.typedSelector(b'v@:@')
+    def flipClicked_(self, sender):
+        files = self.dropZone.files
+        if not files or len(files) == 0:
+            self.writeLog("No file selected to flip.", C_RED)
+            return
+
+        path = str(files[self._selectedIndex])
+        bn = os.path.basename(path)
+
+        try:
+            image = NSImage.alloc().initWithContentsOfFile_(path)
+            if not image:
+                self.writeLog(f"Cannot load: {bn}", C_RED)
+                return
+
+            size = image.size()
+            newImage = NSImage.alloc().initWithSize_(size)
+            newImage.lockFocus()
+
+            transform = NSAffineTransform.transform()
+            transform.translateXBy_yBy_(size.width, 0)
+            transform.scaleXBy_yBy_(-1.0, 1.0)
+            transform.concat()
+
+            image.drawAtPoint_fromRect_operation_fraction_(
+                (0, 0),
+                NSMakeRect(0, 0, size.width, size.height),
+                NSCompositingOperationSourceOver,
+                1.0
+            )
+
+            newImage.unlockFocus()
+
+            # Save as PNG
+            tiffData = newImage.TIFFRepresentation()
+            bitmapRep = NSBitmapImageRep.imageRepWithData_(tiffData)
+            pngData = bitmapRep.representationUsingType_properties_(4, {})  # 4 = NSBitmapImageFileTypePNG
+
+            base, ext = os.path.splitext(path)
+            outPath = base + "_flipped.png"
+            pngData.writeToFile_atomically_(outPath, True)
+
+            # Replace in file list
+            idx = self._selectedIndex
+            files.replaceObjectAtIndex_withObject_(idx, outPath)
+            self.filesUpdated_(files)
+            self.writeLog(f"Flipped: {os.path.basename(outPath)}", C_GREEN)
+
+        except Exception as e:
+            self.writeLog(f"Flip error: {e}", C_RED)
+
+    @objc.typedSelector(b'v@:@')
+    def removeBgClicked_(self, sender):
+        files = self.dropZone.files
+        if not files or len(files) == 0:
+            self.writeLog("No file selected.", C_RED)
+            return
+        if not HAS_VISION:
+            self.writeLog("Vision framework not available.", C_RED)
+            return
+
+        path = str(files[self._selectedIndex])
+        bn = os.path.basename(path)
+        self.writeLog(f"Removing background: {bn}...", C_CYAN)
+
+        try:
+            url = NSURL.fileURLWithPath_(path)
+            ciImg = CIImage.imageWithContentsOfURL_(url)
+            if ciImg is None:
+                self.writeLog(f"Cannot load image: {bn}", C_RED)
+                return
+
+            handler = VNImageRequestHandler.alloc().initWithCIImage_options_(ciImg, None)
+            request = VNGenerateForegroundInstanceMaskRequest.alloc().init()
+
+            success, error = handler.performRequests_error_([request], None)
+            if not success:
+                errMsg = str(error) if error else "unknown error"
+                self.writeLog(f"BG removal failed: {errMsg}", C_RED)
+                return
+
+            results = request.results()
+            if not results or len(results) == 0:
+                self.writeLog(f"No subject detected in: {bn}", C_RED)
+                return
+
+            observation = results[0]
+            allInstances = observation.allInstances()
+
+            maskedImage, error = observation.generateMaskedImageOfInstances_from_croppedToInstancesExtent_error_(
+                allInstances, handler, False, None)
+
+            if maskedImage is None:
+                errMsg = str(error) if error else "unknown error"
+                self.writeLog(f"BG removal failed: {errMsg}", C_RED)
+                return
+
+            # Save as PNG with transparency via NSCIImageRep
+            base, ext = os.path.splitext(path)
+            outPath = base + "_nobg.png"
+
+            rep = NSCIImageRep.imageRepWithCIImage_(maskedImage)
+            nsImg = NSImage.alloc().initWithSize_(rep.size())
+            nsImg.addRepresentation_(rep)
+
+            # Render to bitmap to get proper PNG with alpha
+            imgSize = nsImg.size()
+            bitmapRep = NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(
+                None, int(imgSize.width), int(imgSize.height),
+                8, 4, True, False, "NSCalibratedRGBColorSpace", 0, 0)
+            NSGraphicsContext = objc.lookUpClass('NSGraphicsContext')
+            ctx = NSGraphicsContext.graphicsContextWithBitmapImageRep_(bitmapRep)
+            NSGraphicsContext.setCurrentContext_(ctx)
+            nsImg.drawAtPoint_fromRect_operation_fraction_(
+                (0, 0), NSMakeRect(0, 0, imgSize.width, imgSize.height),
+                NSCompositingOperationSourceOver, 1.0)
+            ctx.flushGraphics()
+
+            pngData = bitmapRep.representationUsingType_properties_(4, {})  # 4 = PNG
+            pngData.writeToFile_atomically_(outPath, True)
+
+            if os.path.exists(outPath):
+                # Replace in file list
+                idx = self._selectedIndex
+                files.replaceObjectAtIndex_withObject_(idx, outPath)
+                self.filesUpdated_(files)
+                self.writeLog(f"BG removed: {os.path.basename(outPath)}", C_GREEN)
+            else:
+                self.writeLog(f"BG removal: failed to save output", C_RED)
+
+        except Exception as e:
+            self.writeLog(f"BG removal error: {e}", C_RED)
 
     @objc.python_method
     def writeLog(self, msg, color=None):
@@ -403,6 +676,9 @@ class AppDelegate(NSObject):
         self.writeLog("IMG2WebP ready. Drop images and click Convert.", C_GRAY)
         self.statusLabel.setStringValue_("Ready")
         self.statusLabel.setTextColor_(C_GRAY)
+        self._selectedIndex = 0
+        self.previewImageView.setImage_(None)
+        self.previewLabel.setStringValue_("PREVIEW")
 
     def applicationShouldTerminateAfterLastWindowClosed_(self, app):
         return True
