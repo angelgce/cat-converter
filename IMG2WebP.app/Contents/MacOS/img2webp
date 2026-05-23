@@ -1,12 +1,13 @@
 #!/Users/angelchavez/Documents/cat-converter/venv/bin/python3
 # -*- coding: utf-8 -*-
-"""IMG2WebP - Drag & Drop image converter to WebP format."""
+"""IMG2WebP - Drag & Drop media converter to WebP/WebM formats."""
 
 import subprocess
 import os
 import sys
 import traceback
 import warnings
+import shutil
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", message="PyObjCPointer")
 
@@ -50,9 +51,14 @@ try:
 except Exception:
     pass
 
-VALID_EXT = {'.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp', '.gif', '.avif', '.webp', '.heic', '.heif'}
-CWEBP = '/opt/homebrew/bin/cwebp'
-FFMPEG = '/opt/homebrew/bin/ffmpeg'
+IMAGE_EXT = {'.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp', '.gif', '.avif', '.webp', '.heic', '.heif'}
+VIDEO_EXT = {
+    '.mp4', '.mov', '.m4v', '.avi', '.mkv', '.webm', '.wmv', '.flv',
+    '.mpeg', '.mpg', '.3gp', '.3g2', '.mts', '.m2ts'
+}
+VALID_EXT = IMAGE_EXT | VIDEO_EXT
+CWEBP = shutil.which('cwebp') or '/opt/homebrew/bin/cwebp'
+FFMPEG = shutil.which('ffmpeg') or '/opt/homebrew/bin/ffmpeg'
 CWEBP_FORMATS = {'.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp', '.gif'}
 
 # -- Colors --
@@ -156,7 +162,7 @@ class DropZoneView(NSView):
         iStr.drawAtPoint_(((w - iSz.width) / 2, h / 2 + 4))
 
         # Label
-        txt = "Drop images here" if count == 0 else ("image" + ("s" if count != 1 else "") + " ready")
+        txt = "Drop images or videos here" if count == 0 else ("file" + ("s" if count != 1 else "") + " ready")
         tAttrs = NSDictionary.dictionaryWithObjects_forKeys_(
             [NSFont.systemFontOfSize_weight_(13, 0.2), C_WHITE50],
             [NSFontAttributeName, NSForegroundColorAttributeName]
@@ -166,7 +172,7 @@ class DropZoneView(NSView):
         tStr.drawAtPoint_(((w - tSz.width) / 2, h / 2 - 26))
 
         # Formats
-        sub = "PNG  JPG  AVIF  HEIC  TIFF  GIF" if count == 0 else "drop more or click Convert"
+        sub = "PNG  JPG  HEIC  GIF  MP4  MOV  MKV" if count == 0 else "drop more or click Convert"
         sAttrs = NSDictionary.dictionaryWithObjects_forKeys_(
             [NSFont.systemFontOfSize_(10), C_GRAY],
             [NSFontAttributeName, NSForegroundColorAttributeName]
@@ -221,7 +227,7 @@ class AppDelegate(NSObject):
                              NSFont.monospacedSystemFontOfSize_weight_(11, 0.3), C_ACCENT))
         cv.addSubview_(label(NSMakeRect(P + 42, y, 200, 28), "IMG2WebP",
                              NSFont.systemFontOfSize_weight_(20, 0.3), C_WHITE))
-        cv.addSubview_(label(NSMakeRect(P + 42, y - 15, 220, 16), "Image to WebP converter",
+        cv.addSubview_(label(NSMakeRect(P + 42, y - 15, 220, 16), "Images to WebP, videos to WebM",
                              NSFont.systemFontOfSize_(11), C_GRAY))
 
         # -- Drop zone --
@@ -259,7 +265,7 @@ class AppDelegate(NSObject):
         flBg.addSubview_(self.fileScrollView)
 
         self.emptyLabel = label(NSMakeRect(0, (flH - 20) / 2 - 4, IW, 20),
-                                "No files yet -- drag images above",
+                                "No files yet -- drag images or videos above",
                                 NSFont.systemFontOfSize_(11), C_GRAY, NSTextAlignmentCenter)
         flBg.addSubview_(self.emptyLabel)
 
@@ -382,7 +388,7 @@ class AppDelegate(NSObject):
         # Show window
         self.window.makeKeyAndOrderFront_(None)
         NSApp.activateIgnoringOtherApps_(True)
-        self.writeLog("IMG2WebP ready. Drop images and click Convert.", C_GRAY)
+        self.writeLog("IMG2WebP ready. Drop images or videos and click Convert.", C_GRAY)
         if not HAS_VISION:
             self.writeLog("Vision framework not available - BG removal disabled.", C_GRAY)
 
@@ -439,19 +445,33 @@ class AppDelegate(NSObject):
             self._updatePreview()
 
     @objc.python_method
+    def _isVideoFile(self, path):
+        return os.path.splitext(str(path))[1].lower() in VIDEO_EXT
+
+    @objc.python_method
     def _updatePreview(self):
         files = self.dropZone.files
         count = len(files) if files else 0
         if count == 0:
             self.previewImageView.setImage_(None)
             self.previewLabel.setStringValue_("PREVIEW")
+            self.flipBtn.setEnabled_(True)
+            self.removeBgBtn.setEnabled_(HAS_VISION)
             return
         idx = max(0, min(self._selectedIndex, count - 1))
         self._selectedIndex = idx
         path = str(files[idx])
-        image = NSImage.alloc().initWithContentsOfFile_(path)
+        is_video = self._isVideoFile(path)
+        if is_video:
+            image = None
+            kind = "VIDEO"
+        else:
+            image = NSImage.alloc().initWithContentsOfFile_(path)
+            kind = "IMAGE"
         self.previewImageView.setImage_(image)
-        self.previewLabel.setStringValue_(f"PREVIEW ({idx + 1}/{count})")
+        self.previewLabel.setStringValue_(f"PREVIEW ({idx + 1}/{count}) - {kind}")
+        self.flipBtn.setEnabled_(not is_video)
+        self.removeBgBtn.setEnabled_((not is_video) and HAS_VISION)
 
     @objc.typedSelector(b'v@:@')
     def prevClicked_(self, sender):
@@ -478,6 +498,9 @@ class AppDelegate(NSObject):
 
         path = str(files[self._selectedIndex])
         bn = os.path.basename(path)
+        if self._isVideoFile(path):
+            self.writeLog(f"Flip is only available for images: {bn}", C_RED)
+            return
 
         try:
             image = NSImage.alloc().initWithContentsOfFile_(path)
@@ -533,6 +556,9 @@ class AppDelegate(NSObject):
 
         path = str(files[self._selectedIndex])
         bn = os.path.basename(path)
+        if self._isVideoFile(path):
+            self.writeLog(f"BG removal is only available for images: {bn}", C_RED)
+            return
         self.writeLog(f"Removing background: {bn}...", C_CYAN)
 
         try:
@@ -616,6 +642,31 @@ class AppDelegate(NSObject):
         storage.appendAttributedString_(s)
         self.logView.scrollRangeToVisible_((storage.length(), 0))
 
+    @objc.python_method
+    def _outputPath(self, fp, out_ext):
+        base = os.path.splitext(fp)[0]
+        out = base + out_ext
+        if os.path.abspath(out) == os.path.abspath(fp):
+            out = base + "_converted" + out_ext
+        return out
+
+    @objc.python_method
+    def _missingTool(self, tool_path):
+        return not tool_path or not os.path.exists(tool_path)
+
+    @objc.python_method
+    def _sizeChangeText(self, orig, new):
+        if orig <= 0:
+            return "0%"
+        delta = orig - new
+        pct = abs((delta * 100) // orig)
+        return f"-{pct}%" if delta >= 0 else f"+{pct}%"
+
+    @objc.python_method
+    def _totalChangeText(self, total_saved):
+        mb = abs(total_saved) / (1024 * 1024)
+        return f"{mb:.1f} MB saved" if total_saved >= 0 else f"{mb:.1f} MB larger"
+
     @objc.typedSelector(b'v@:@')
     def convertClicked_(self, sender):
         files = self.dropZone.files
@@ -634,34 +685,52 @@ class AppDelegate(NSObject):
 
         for fp in list(files):
             fp = str(fp)
-            out = os.path.splitext(fp)[0] + ".webp"
             bn = os.path.basename(fp)
 
             try:
                 ext = os.path.splitext(fp)[1].lower()
-                if ext in CWEBP_FORMATS:
-                    r = subprocess.run([CWEBP, '-q', '80', fp, '-o', out],
-                                       capture_output=True, text=True, timeout=30)
+                is_video = ext in VIDEO_EXT
+                if is_video:
+                    out = self._outputPath(fp, ".webm")
+                    if self._missingTool(FFMPEG):
+                        raise RuntimeError(f"ffmpeg not found at {FFMPEG}")
+                    r = subprocess.run([
+                        FFMPEG, '-y', '-i', fp,
+                        '-c:v', 'libvpx-vp9', '-crf', '34', '-b:v', '0',
+                        '-row-mt', '1',
+                        '-c:a', 'libopus', '-b:a', '96k',
+                        out
+                    ], capture_output=True, text=True, timeout=600)
                 else:
-                    r = subprocess.run([FFMPEG, '-y', '-i', fp, '-quality', '80', out],
-                                       capture_output=True, text=True, timeout=30)
-                if r.returncode == 0:
+                    out = self._outputPath(fp, ".webp")
+                    if ext in CWEBP_FORMATS and not self._missingTool(CWEBP):
+                        r = subprocess.run([CWEBP, '-q', '80', fp, '-o', out],
+                                           capture_output=True, text=True, timeout=60)
+                    else:
+                        if self._missingTool(FFMPEG):
+                            raise RuntimeError(f"ffmpeg not found at {FFMPEG}")
+                        r = subprocess.run([FFMPEG, '-y', '-i', fp, '-quality', '80', out],
+                                           capture_output=True, text=True, timeout=60)
+
+                if r.returncode == 0 and os.path.exists(out):
                     orig = os.path.getsize(fp)
                     new = os.path.getsize(out)
-                    pct = ((orig - new) * 100) // orig if orig > 0 else 0
                     total_saved += orig - new
-                    self.writeLog(f"  OK   {bn}  -{pct}%", C_GREEN)
+                    change = self._sizeChangeText(orig, new)
+                    self.writeLog(f"  OK   {bn} -> {os.path.basename(out)}  {change}", C_GREEN)
                     ok += 1
                 else:
-                    self.writeLog(f"  FAIL {bn}", C_RED)
+                    err = (r.stderr or r.stdout or "").strip().splitlines()
+                    detail = f": {err[-1]}" if err else ""
+                    self.writeLog(f"  FAIL {bn}{detail}", C_RED)
                     fail += 1
             except Exception as e:
                 self.writeLog(f"  FAIL {bn}: {e}", C_RED)
                 fail += 1
 
-        mb = total_saved / (1024 * 1024)
-        self.writeLog(f"Done: {ok} converted, {fail} failed, {mb:.1f} MB saved", C_ACCENT)
-        self.statusLabel.setStringValue_(f"Done - {mb:.1f} MB saved")
+        total_text = self._totalChangeText(total_saved)
+        self.writeLog(f"Done: {ok} converted, {fail} failed, {total_text}", C_ACCENT)
+        self.statusLabel.setStringValue_(f"Done - {total_text}")
         self.statusLabel.setTextColor_(C_GREEN)
 
     @objc.typedSelector(b'v@:@')
@@ -673,12 +742,14 @@ class AppDelegate(NSObject):
         for sv in list(self.fileContainer.subviews()):
             sv.removeFromSuperview()
         self.logView.setString_("")
-        self.writeLog("IMG2WebP ready. Drop images and click Convert.", C_GRAY)
+        self.writeLog("IMG2WebP ready. Drop images or videos and click Convert.", C_GRAY)
         self.statusLabel.setStringValue_("Ready")
         self.statusLabel.setTextColor_(C_GRAY)
         self._selectedIndex = 0
         self.previewImageView.setImage_(None)
         self.previewLabel.setStringValue_("PREVIEW")
+        self.flipBtn.setEnabled_(True)
+        self.removeBgBtn.setEnabled_(HAS_VISION)
 
     def applicationShouldTerminateAfterLastWindowClosed_(self, app):
         return True
